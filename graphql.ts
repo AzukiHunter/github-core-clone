@@ -71,7 +71,10 @@ function tokenize(src: string): string[] {
 
 class Parser {
   private pos = 0;
-  constructor(private tokens: string[]) {}
+  private tokens: string[];
+  constructor(tokens: string[]) {
+    this.tokens = tokens;
+  }
   peek(): string | undefined { return this.tokens[this.pos]; }
   next(): string {
     const t = this.tokens[this.pos];

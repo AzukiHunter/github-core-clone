@@ -143,9 +143,9 @@ export function lsRefs(repo: RepoRec, packets: Packet[]): Buffer {
     if (prefixes.length && !prefixes.some((p) => line.name.startsWith(p))) continue;
     let text = `${line.oid} ${line.name}`;
     if (symrefs && line.symrefTarget) text += ` symref-target:${line.symrefTarget}`;
+    if (peel && line.peeled) text += ` peeled:${line.peeled}`;
     if (line.unborn) text += ' unborn';
     parts.push(pktLine(`${text}\n`));
-    if (peel && line.peeled) parts.push(pktLine(`${line.peeled} ${line.name}^{}\n`));
   }
   parts.push(PKT_FLUSH);
   return Buffer.concat(parts);

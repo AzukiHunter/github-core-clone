@@ -250,7 +250,7 @@ export function buildPack(repo: RepoRec, oids: string[]): Buffer {
   for (const oid of oids) {
     const obj = repo.objects.get(oid);
     if (!obj) continue;
-    const size = obj.data.length;
+    let size = obj.data.length;
     const typeNum = TYPE_NUM[obj.type];
     const bytes: number[] = [];
     let first = (typeNum << 4) | (size & 0x0f);

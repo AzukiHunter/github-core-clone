@@ -558,7 +558,7 @@ async function handleRepoScoped(req: IncomingMessage, res: ServerResponse, url: 
         files.set(path, { oid: blob, mode: '100644' });
         const commit = commitFiles(repo, branch, files, message);
         return sendJson(res, existing ? 200 : 201, {
-          content: { type: 'file', name: path.split('/').pop(), path, sha: blob, size: content.length },
+          content: { type: 'file', name: path.split('/').pop(), path, sha: blob, size: content.length, encoding: 'base64' },
           commit: { sha: commit, message },
         });
       }
