@@ -61,6 +61,29 @@ export function parseCommit(data: Buffer): CommitInfo {
   return { tree, parents, author, committer, message };
 }
 
+// Parsed commits are immutable (stored object bytes never change), so parse
+// once per repo and reuse: history walks and fetch planning re-read the same
+// commits many times.
+const commitInfoCache = new WeakMap<RepoRec, Map<string, CommitInfo>>();
+
+/** The parsed commit for an oid in this repo (cached), or undefined. */
+export function getCommitInfo(repo: RepoRec, oid: string): CommitInfo | undefined {
+  let cache = commitInfoCache.get(repo);
+  if (cache) {
+    const hit = cache.get(oid);
+    if (hit) return hit;
+  }
+  const obj = repo.objects.get(oid);
+  if (!obj || obj.type !== 'commit') return undefined;
+  const info = parseCommit(obj.data);
+  if (!cache) {
+    cache = new Map();
+    commitInfoCache.set(repo, cache);
+  }
+  cache.set(oid, info);
+  return info;
+}
+
 export function buildCommit(tree: string, parents: string[], author: string, committer: string, message: string): Buffer {
   const lines = [`tree ${tree}`];
   for (const p of parents) lines.push(`parent ${p}`);
@@ -168,7 +191,7 @@ export function closure(repo: RepoRec, tips: Iterable<string>): Set<string> {
     if (!obj) continue;
     seen.add(oid);
     if (obj.type === 'commit') {
-      const c = parseCommit(obj.data);
+      const c = getCommitInfo(repo, oid) as CommitInfo;
       stack.push(c.tree, ...c.parents);
     } else if (obj.type === 'tree') {
       for (const e of parseTree(obj.data)) stack.push(e.oid);
@@ -189,8 +212,8 @@ export function isAncestor(repo: RepoRec, ancestor: string, descendant: string):
     if (oid === ancestor) return true;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const obj = repo.objects.get(oid);
-    if (obj && obj.type === 'commit') stack.push(...parseCommit(obj.data).parents);
+    const info = getCommitInfo(repo, oid);
+    if (info) stack.push(...info.parents);
   }
   return false;
 }
@@ -217,8 +240,8 @@ export function mergeBase(repo: RepoRec, a: string, b: string): string | null {
       const oid = stack.pop() as string;
       if (set.has(oid)) continue;
       set.add(oid);
-      const obj = repo.objects.get(oid);
-      if (obj && obj.type === 'commit') stack.push(...parseCommit(obj.data).parents);
+      const info = getCommitInfo(repo, oid);
+      if (info) stack.push(...info.parents);
     }
     return set;
   };
@@ -231,8 +254,8 @@ export function mergeBase(repo: RepoRec, a: string, b: string): string | null {
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (fromA.has(oid)) return oid;
-    const obj = repo.objects.get(oid);
-    if (obj && obj.type === 'commit') queue.push(...parseCommit(obj.data).parents);
+    const info = getCommitInfo(repo, oid);
+    if (info) queue.push(...info.parents);
   }
   return null;
 }
@@ -371,10 +394,9 @@ export function receivePack(repo: RepoRec, pack: Buffer): string[] {
       baseOid = pack.subarray(pos, pos + 20).toString('hex');
       pos += 20;
     }
-    const inflated = inflateSync(pack.subarray(pos));
-    // inflateSync consumed exactly one stream: find its length by re-walking the
-    // deflate stream end is not exposed, so use the zlib stream scan below.
-    pos += deflateStreamLength(pack.subarray(pos));
+    const stream = inflateFirstStream(pack.subarray(pos), size);
+    const inflated = stream.data;
+    pos += stream.bytes;
     if (inflated.length !== size) throw new Error('pack object size mismatch');
     const idx = entries.length;
     byOffset.set(entryStart, idx);
@@ -436,6 +458,52 @@ export function receivePack(repo: RepoRec, pack: Buffer): string[] {
   return stored;
 }
 
+/**
+ * Inflate the first zlib stream in `buf` and report how many bytes it spans.
+ *
+ * Node's zlib does not expose a sync stream's consumed length, and locating
+ * the end by probing prefixes costs a full inflate per probe (~13 per object
+ * in the old binary search). Instead, a bit-level scan of the deflate stream
+ * (below) predicts the length; the prediction is only trusted once proven
+ * exact: the slice of that length must inflate, and one byte less must not
+ * (inflateSync tolerates trailing bytes, so an overshooting candidate would
+ * inflate from the shorter slice too). Any doubt falls back to probing.
+ */
+function inflateFirstStream(buf: Buffer, expectedSize: number): { data: Buffer; bytes: number } {
+  const scanned = scanZlibStreamLength(buf, expectedSize);
+  if (scanned !== null && scanned >= 8 && scanned <= buf.length) {
+    try {
+      const data = inflateSync(buf.subarray(0, scanned));
+      if (data.length === expectedSize && !inflatesFully(buf.subarray(0, scanned - 1))) {
+        return { data, bytes: scanned };
+      }
+    } catch {
+      // fall through to the probing path
+    }
+  }
+  const data = inflateSync(buf);
+  return { data, bytes: deflateStreamLength(buf) };
+}
+
+/**
+ * Whether `buf` inflates as one complete stream. Used to prove a scanned
+ * length minimal; the expected answer is "no", delivered as an exception —
+ * so stack capture is switched off for the duration of the (synchronous)
+ * probe, which is where most of a throw's cost sits.
+ */
+function inflatesFully(buf: Buffer): boolean {
+  const limit = Error.stackTraceLimit;
+  Error.stackTraceLimit = 0;
+  try {
+    inflateSync(buf);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    Error.stackTraceLimit = limit;
+  }
+}
+
 /** Length in bytes of the first complete zlib stream at the start of `buf`. */
 function deflateStreamLength(buf: Buffer): number {
   // Binary-search the smallest prefix that inflateSync accepts as a full stream.
@@ -456,4 +524,204 @@ function deflateStreamLength(buf: Buffer): number {
     else lo = mid + 1;
   }
   return lo;
+}
+
+// ---------------------------------------------------------------- deflate scan
+//
+// A bit-level reader over a deflate stream that decodes Huffman symbols only
+// to find where the stream ends (the produced data itself is discarded; the
+// caller inflates with zlib). It throws on anything unexpected, and its one
+// caller treats a throw as "no prediction" — never as pack corruption.
+
+class BitReader {
+  pos = 0;
+  private bit = 0;
+  private readonly buf: Buffer;
+
+  constructor(buf: Buffer) {
+    this.buf = buf;
+  }
+
+  read(n: number): number {
+    let v = 0;
+    for (let i = 0; i < n; i++) {
+      if (this.pos >= this.buf.length) throw new Error('deflate scan overran the buffer');
+      const byte = this.buf[this.pos] as number;
+      v |= ((byte >> this.bit) & 1) << i;
+      this.bit += 1;
+      if (this.bit === 8) {
+        this.bit = 0;
+        this.pos += 1;
+      }
+    }
+    return v;
+  }
+
+  alignToByte(): void {
+    if (this.bit !== 0) {
+      this.bit = 0;
+      this.pos += 1;
+    }
+  }
+
+  /** Bytes the consumed bits occupy (a partial byte counts whole). */
+  get byteLength(): number {
+    return this.pos + (this.bit > 0 ? 1 : 0);
+  }
+
+  byteAt(index: number): number {
+    const byte = this.buf[index];
+    if (byte === undefined) throw new Error('deflate scan overran the buffer');
+    return byte;
+  }
+}
+
+interface HuffTable {
+  counts: Uint16Array;
+  symbols: Uint16Array;
+}
+
+function buildHuff(lengths: Uint8Array): HuffTable {
+  const counts = new Uint16Array(16);
+  for (const l of lengths) counts[l] = (counts[l] as number) + 1;
+  counts[0] = 0;
+  const offs = new Uint16Array(16);
+  for (let i = 1; i < 16; i++) offs[i] = (offs[i - 1] as number) + (counts[i - 1] as number);
+  const symbols = new Uint16Array(lengths.length);
+  lengths.forEach((l, sym) => {
+    if (l !== 0) {
+      symbols[offs[l] as number] = sym;
+      offs[l] = (offs[l] as number) + 1;
+    }
+  });
+  return { counts, symbols };
+}
+
+function huffDecode(bits: BitReader, h: HuffTable): number {
+  let code = 0;
+  let first = 0;
+  let index = 0;
+  for (let len = 1; len < 16; len++) {
+    code |= bits.read(1);
+    const count = h.counts[len] as number;
+    if (code - first < count) return h.symbols[index + (code - first)] as number;
+    index += count;
+    first = (first + count) << 1;
+    code <<= 1;
+  }
+  throw new Error('deflate scan met an invalid huffman code');
+}
+
+const LENGTH_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LENGTH_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const CODE_LENGTH_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+const FIXED_LIT_LENGTHS = new Uint8Array(288);
+for (let i = 0; i < 288; i++) FIXED_LIT_LENGTHS[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8;
+const FIXED_LIT_HUFF = buildHuff(FIXED_LIT_LENGTHS);
+const FIXED_DIST_HUFF = buildHuff(new Uint8Array(30).fill(5));
+
+/** Walk one compressed block, counting produced bytes; throws past `budget`. */
+function scanCompressedBlock(bits: BitReader, lit: HuffTable, dist: HuffTable, budget: number): number {
+  let produced = 0;
+  for (let symbols = 0; ; symbols++) {
+    // Every symbol but end-of-block produces at least one byte.
+    if (symbols > budget + 1) throw new Error('deflate scan produced beyond the expected size');
+    const sym = huffDecode(bits, lit);
+    if (sym < 256) {
+      produced += 1;
+      continue;
+    }
+    if (sym === 256) return produced;
+    const li = sym - 257;
+    if (li >= LENGTH_BASE.length) throw new Error('deflate scan met a bad length symbol');
+    produced += (LENGTH_BASE[li] as number) + bits.read(LENGTH_EXTRA[li] as number);
+    if (produced > budget) throw new Error('deflate scan produced beyond the expected size');
+    const dsym = huffDecode(bits, dist);
+    if (dsym >= DIST_EXTRA.length) throw new Error('deflate scan met a bad distance symbol');
+    bits.read(DIST_EXTRA[dsym] as number);
+  }
+}
+
+/** The exact byte length of the zlib stream at the start of `buf`. */
+function scanZlibStream(buf: Buffer, expectedSize: number): number {
+  if (buf.length < 2) throw new Error('deflate scan needs a header');
+  const cmf = buf[0] as number;
+  const flg = buf[1] as number;
+  if ((cmf & 0x0f) !== 8) throw new Error('not a deflate stream');
+  if (((cmf << 8) + flg) % 31 !== 0) throw new Error('bad zlib header check');
+  if (flg & 0x20) throw new Error('preset dictionary streams are not scanned');
+  const bits = new BitReader(buf);
+  bits.read(16);
+  let produced = 0;
+  let finished = false;
+  for (let block = 0; block <= buf.length && !finished; block++) {
+    const bfinal = bits.read(1);
+    const btype = bits.read(2);
+    if (btype === 0) {
+      bits.alignToByte();
+      const len = bits.byteAt(bits.pos) | (bits.byteAt(bits.pos + 1) << 8);
+      const nlen = bits.byteAt(bits.pos + 2) | (bits.byteAt(bits.pos + 3) << 8);
+      if (len !== (~nlen & 0xffff)) throw new Error('stored block length check failed');
+      bits.pos += 4 + len;
+      if (bits.pos > buf.length) throw new Error('deflate scan overran the buffer');
+      produced += len;
+    } else if (btype === 1) {
+      produced += scanCompressedBlock(bits, FIXED_LIT_HUFF, FIXED_DIST_HUFF, expectedSize - produced);
+    } else if (btype === 2) {
+      const hlit = bits.read(5) + 257;
+      const hdist = bits.read(5) + 1;
+      const hclen = bits.read(4) + 4;
+      const clLengths = new Uint8Array(19);
+      for (let i = 0; i < hclen; i++) clLengths[CODE_LENGTH_ORDER[i] as number] = bits.read(3);
+      const clHuff = buildHuff(clLengths);
+      const total = hlit + hdist;
+      const lengths = new Uint8Array(total);
+      let i = 0;
+      while (i < total) {
+        const sym = huffDecode(bits, clHuff);
+        if (sym < 16) {
+          lengths[i] = sym;
+          i += 1;
+        } else if (sym === 16) {
+          if (i === 0) throw new Error('code length repeat with nothing before it');
+          const prev = lengths[i - 1] as number;
+          let rep = 3 + bits.read(2);
+          while (rep > 0) {
+            if (i >= total) throw new Error('code lengths overrun');
+            lengths[i] = prev;
+            i += 1;
+            rep -= 1;
+          }
+        } else if (sym === 17) {
+          i += 3 + bits.read(3);
+        } else if (sym === 18) {
+          i += 11 + bits.read(7);
+        } else {
+          throw new Error('bad code length symbol');
+        }
+      }
+      if (i !== total) throw new Error('code lengths overrun');
+      const litHuff = buildHuff(lengths.subarray(0, hlit));
+      const distHuff = buildHuff(lengths.subarray(hlit));
+      produced += scanCompressedBlock(bits, litHuff, distHuff, expectedSize - produced);
+    } else {
+      throw new Error('bad deflate block type');
+    }
+    if (produced > expectedSize) throw new Error('deflate scan produced beyond the expected size');
+    if (bfinal === 1) finished = true;
+  }
+  if (!finished) throw new Error('deflate scan never met the final block');
+  if (produced !== expectedSize) throw new Error('deflate scan size mismatch');
+  return bits.byteLength + 4; // trailing adler32
+}
+
+/** scanZlibStream, as a prediction: null whenever anything is in doubt. */
+function scanZlibStreamLength(buf: Buffer, expectedSize: number): number | null {
+  try {
+    return scanZlibStream(buf, expectedSize);
+  } catch {
+    return null;
+  }
 }

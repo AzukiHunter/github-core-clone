@@ -2,7 +2,7 @@
 // v2), ls-refs, fetch for upload-pack (v0 wants/haves/done and v2 fetch with
 // sections), shallow handling, and receive-pack pushes with report-status.
 
-import { ZERO_OID, buildPack, closure, getObject, isAncestor, parseCommit, parseTree, peelToCommit, receivePack } from './git.ts';
+import { ZERO_OID, buildPack, closure, getCommitInfo, getObject, isAncestor, parseTree, peelToCommit, receivePack } from './git.ts';
 import type { RepoRec } from './store.ts';
 
 // ---------------------------------------------------------------- pkt-lines
@@ -185,6 +185,11 @@ export function planFetch(
   }
 
   // Generation distance from the wants, following commit parents only.
+  // With an absolute depth limit (and no deepen request, whose base needs the
+  // shallow commits' true generations) the walk stops at the limit: commits
+  // at or beyond it are excluded by the inclusion pass either way, and a
+  // parent's missing generation reads exactly like one at the limit there.
+  const pruneAt = deepen === null ? depth : null;
   const gen = new Map<string, number>();
   const queue: Array<[string, number]> = [];
   for (const w of wants) queue.push([w, 0]);
@@ -192,9 +197,10 @@ export function planFetch(
     const [oid, g] = queue.shift() as [string, number];
     if (gen.has(oid) && (gen.get(oid) as number) <= g) continue;
     gen.set(oid, g);
-    const obj = getObject(repo, peelToCommit(repo, oid));
-    if (obj && obj.type === 'commit') {
-      for (const p of parseCommit(obj.data).parents) queue.push([p, g + 1]);
+    if (pruneAt !== null && g + 1 >= pruneAt) continue;
+    const info = getCommitInfo(repo, peelToCommit(repo, oid));
+    if (info) {
+      for (const p of info.parents) queue.push([p, g + 1]);
     }
   }
 
@@ -219,10 +225,9 @@ export function planFetch(
     if (isShallowKnown && deepen === null && depth === null) continue; // boundary already held
     if (isShallowKnown && limit !== null && g >= limit) continue;
     // Include this commit and its tree/blobs.
-    const commitObj = getObject(repo, commitOid);
-    if (!commitObj || commitObj.type !== 'commit') continue;
+    const info = getCommitInfo(repo, commitOid);
+    if (!info) continue;
     included.add(commitOid);
-    const info = parseCommit(commitObj.data);
     for (const sub of closure(repo, [info.tree])) if (!haveSet.has(sub)) included.add(sub);
     const atBoundary = limit !== null && g === limit - 1;
     const parentsExcluded = info.parents.some((p) => {
@@ -261,7 +266,8 @@ function boundedClosure(repo: RepoRec, tip: string, boundary: Set<string>): Set<
     if (!obj) continue;
     seen.add(oid);
     if (obj.type === 'commit') {
-      const c = parseCommit(obj.data);
+      const c = getCommitInfo(repo, oid);
+      if (!c) continue;
       stack.push(c.tree);
       if (!boundary.has(oid)) stack.push(...c.parents);
     } else if (obj.type === 'tree') {

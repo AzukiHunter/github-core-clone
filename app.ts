@@ -80,6 +80,8 @@ async function readJson(req: IncomingMessage): Promise<{ value: Record<string, u
 
 // ---------------------------------------------------------------- JSON views
 
+const EPOCH_ISO = new Date(1_735_689_600_000).toISOString();
+
 export function repoJson(repo: RepoRec): Record<string, unknown> {
   return {
     id: repo.id,
@@ -91,8 +93,8 @@ export function repoJson(repo: RepoRec): Record<string, unknown> {
     description: repo.description,
     default_branch: repo.defaultBranch,
     fork: false,
-    created_at: new Date(1_735_689_600_000).toISOString(),
-    updated_at: new Date(1_735_689_600_000).toISOString(),
+    created_at: EPOCH_ISO,
+    updated_at: EPOCH_ISO,
   };
 }
 
