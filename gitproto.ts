@@ -2,7 +2,7 @@
 // v2), ls-refs, fetch for upload-pack (v0 wants/haves/done and v2 fetch with
 // sections), shallow handling, and receive-pack pushes with report-status.
 
-import { ZERO_OID, buildPack, closure, getObject, isAncestor, parseCommit, peelToCommit, receivePack } from './git.ts';
+import { ZERO_OID, buildPack, closure, getObject, isAncestor, parseCommit, parseTree, peelToCommit, receivePack } from './git.ts';
 import type { RepoRec } from './store.ts';
 
 // ---------------------------------------------------------------- pkt-lines
@@ -175,12 +175,14 @@ export function planFetch(
   depth: number | null,
   deepen: number | null,
 ): FetchPlan {
+  const shallowSet = new Set(clientShallow);
   const haveSet = new Set<string>();
   for (const h of haves) {
     haveSet.add(h);
-    for (const oid of closure(repo, [h])) haveSet.add(oid);
+    // What the client holds: the closure of its haves, but a shallow client's
+    // boundary commits do not imply their ancestors — it never received those.
+    for (const oid of boundedClosure(repo, h, shallowSet)) haveSet.add(oid);
   }
-  const shallowSet = new Set(clientShallow);
 
   // Generation distance from the wants, following commit parents only.
   const gen = new Map<string, number>();
@@ -246,6 +248,30 @@ export function planFetch(
     shallow: [...new Set(newShallow)],
     unshallow: [...new Set(unshallow)].filter((oid) => !newShallow.includes(oid)),
   };
+}
+
+/** Closure of one tip that does not descend past boundary commits' parents. */
+function boundedClosure(repo: RepoRec, tip: string, boundary: Set<string>): Set<string> {
+  const seen = new Set<string>();
+  const stack = [tip];
+  while (stack.length) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (!obj) continue;
+    seen.add(oid);
+    if (obj.type === 'commit') {
+      const c = parseCommit(obj.data);
+      stack.push(c.tree);
+      if (!boundary.has(oid)) stack.push(...c.parents);
+    } else if (obj.type === 'tree') {
+      for (const e of parseTree(obj.data)) stack.push(e.oid);
+    } else if (obj.type === 'tag') {
+      const target = peelToCommit(repo, oid);
+      if (target !== oid) stack.push(target);
+    }
+  }
+  return seen;
 }
 
 const packCache = new Map<string, Buffer>();
